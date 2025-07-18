@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Manga Downloader</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>Manga Chapter Downloader</h1>
+        <div id="manga-title" class="manga-title"></div>
+      </header>
+
+      <main>
+        <div id="not-manga-page" class="message hidden">
+          <p>Please navigate to a manga series page to use this extension.</p>
+        </div>
+
+        <div id="manga-content" class="hidden">
+          <div class="search-container">
+            <input
+              type="text"
+              id="search-bar"
+              class="search-bar"
+              placeholder="Search for a chapter..."
+            />
+          </div>
+
+          <div class="range-container">
+            <input
+              type="number"
+              id="range-start"
+              class="search-bar"
+              placeholder="Start Chapter"
+            />
+            <input
+              type="number"
+              id="range-end"
+              class="search-bar"
+              placeholder="End Chapter"
+            />
+            <button id="apply-range" class="btn btn-secondary">
+              Apply Range
+            </button>
+          </div>
+
+          <div class="controls">
+            <button id="select-all" class="btn btn-secondary">
+              Select All
+            </button>
+            <button id="deselect-all" class="btn btn-secondary">
+              Deselect All
+            </button>
+            <button id="sort-chapters" class="btn btn-secondary">
+              Sort Chapters
+            </button>
+            <button id="download-selected" class="btn btn-primary" disabled>
+              Download Selected (<span id="selected-count">0</span>)
+            </button>
+          </div>
+
+          <div id="chapters-list" class="chapters-list"></div>
+        </div>
+      </main>
+
+      <footer>
+        <div id="status" class="status"></div>
+      </footer>
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
