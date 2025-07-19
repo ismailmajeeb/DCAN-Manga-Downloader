@@ -1,4 +1,4 @@
-// Content script to extract chapter information from the manga page
+// content.js (Modified)
 
 (function () {
   "use strict";
@@ -50,9 +50,9 @@
   // Function to convert image URL to base64
   async function imageUrlToBase64(url) {
     try {
-      // Fetch the image directly from the content script context
-      // No 'no-cors' needed as it's expected to be same-origin or handle CORS naturally
-      const response = await fetch(url);
+      // **MODIFICATION: Add cache control to prevent browser from storing images**
+      const response = await fetch(url, { cache: "no-store" }); //
+
       if (!response.ok) {
         throw new Error(
           `HTTP error! Status: ${response.status} for URL: ${url}`,
@@ -94,7 +94,6 @@
         `[Content Script] Found ${imageUrls.length} image URLs for ${chapterName}.`,
       );
 
-      // Send images one by one to background script
       for (let i = 0; i < imageUrls.length; i++) {
         const imageUrl = imageUrls[i];
         try {
@@ -105,16 +104,12 @@
             imageIndex: i,
             base64: base64,
           });
-          console.log(
-            `[Content Script] Sent image ${i} for ${chapterName} to background.`,
-          );
-          await new Promise((resolve) => setTimeout(resolve, 50)); // Small delay to prevent message congestion
+          await new Promise((resolve) => setTimeout(resolve, 50));
         } catch (error) {
           console.error(
-            `[Content Script] Failed to process and send image ${i} (${imageUrl}) for ${chapterName}:`,
+            `[Content Script] Failed to process image ${i} (${imageUrl}):`,
             error,
           );
-          // Send an error chunk to background script
           chrome.runtime.sendMessage({
             action: "imageChunk",
             chapterName: chapterName,
@@ -124,11 +119,10 @@
         }
       }
 
-      // Signal completion for this chapter to background script
       chrome.runtime.sendMessage({
         action: "chapterDownloadComplete",
         chapterName: chapterName,
-        totalImages: imageUrls.length, // Send total count for verification
+        totalImages: imageUrls.length,
       });
       console.log(
         `[Content Script] Finished sending all images for chapter: ${chapterName}.`,
@@ -139,16 +133,15 @@
       };
     } catch (error) {
       console.error(
-        `[Content Script] Error extracting or sending chapter images for ${chapterName}:`,
+        `[Content Script] Error extracting chapter images for ${chapterName}:`,
         error,
       );
-      // Signal error to background script
       chrome.runtime.sendMessage({
         action: "chapterDownloadError",
         chapterName: chapterName,
         error: error.message,
       });
-      throw error; // Re-throw to propagate error to caller if needed
+      throw error;
     }
   }
 
@@ -159,15 +152,14 @@
       const mangaTitle = extractMangaTitle();
       sendResponse({ chapters, mangaTitle });
     } else if (request.action === "startChapterImageFetch") {
-      // New action to start fetching images in content.js
       extractAndSendChapterImages(request.chapterUrl, request.chapterName)
         .then((response) => {
-          sendResponse(response); // Acknowledge the request to background
+          sendResponse(response);
         })
         .catch((error) => {
           sendResponse({ success: false, error: error.message });
         });
-      return true; // Keep the message channel open for async response
+      return true;
     }
   });
 })();

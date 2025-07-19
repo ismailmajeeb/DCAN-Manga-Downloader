@@ -1,4 +1,5 @@
-// --- Step 1: Attempt to import the JSZip library ---
+// background.js (With Enhanced Logging)
+
 try {
   importScripts("lib/jszip.min.js");
   console.log("✅ SUCCESS: JSZip library imported successfully.");
@@ -9,149 +10,141 @@ try {
   );
 }
 
-// --- Global variable to hold the active tab ID ---
-let activeTabId;
+let activeDownloadTabId = null;
+const chapterImageBuffers = new Map();
 
-chrome.tabs.onActivated.addListener((activeInfo) => {
-  activeTabId = activeInfo.tabId;
-});
+function forceStopAllDownloads(reason) {
+  console.warn(`🛑 FORCE STOP: ${reason}. Clearing all pending operations.`);
+  const keys = Array.from(chapterImageBuffers.keys());
+  keys.forEach((key) => {
+    const buffer = chapterImageBuffers.get(key);
+    if (buffer && buffer.resolveCallback) {
+      buffer.resolveCallback({
+        success: false,
+        error: `Operation cancelled: ${reason}`,
+      });
+    }
+  });
+  chapterImageBuffers.clear();
+  activeDownloadTabId = null;
+  console.log("- All buffers cleared and download process halted.");
+}
 
-chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-  if (tabs.length > 0) {
-    activeTabId = tabs[0].id;
+chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
+  if (tabId === activeDownloadTabId) {
+    forceStopAllDownloads(`Target tab ${tabId} was closed`);
   }
 });
 
-// --- Map to hold images being collected for each chapter ---
-// Key: chapterName, Value: { receivedImages: Array, expectedImages: Promise.resolve, resolveCallback: Function }
-const chapterImageBuffers = new Map();
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (tabId === activeDownloadTabId && changeInfo.url) {
+    if (!changeInfo.url.includes("manga.detectiveconanar.com/manga/")) {
+      forceStopAllDownloads(
+        `Target tab ${tabId} navigated away to ${changeInfo.url}`,
+      );
+    }
+  }
+});
 
-// --- Listener for messages from the popup and content script ---
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "startDownload") {
-    console.log("🟢 INFO: 'startDownload' message received from popup.");
-    downloadChaptersInBackground(request.chapters, request.mangaTitle);
-    sendResponse({ success: true, message: "Download started." });
+    if (request.tabId) {
+      activeDownloadTabId = request.tabId;
+      console.log(
+        `🟢 INFO: 'startDownload' message received for Tab ID: ${activeDownloadTabId}`,
+      );
+      downloadChaptersInBackground(request.chapters, request.mangaTitle);
+      sendResponse({ success: true, message: "Download started." });
+    } else {
+      console.error(
+        "❌ ERROR: 'startDownload' message received without a tabId.",
+      );
+      sendResponse({ success: false, message: "Missing tab ID." });
+    }
   } else if (request.action === "imageChunk") {
-    // Message from content script with an individual image chunk
     const { chapterName, imageIndex, base64, error } = request;
-
     if (!chapterImageBuffers.has(chapterName)) {
       console.warn(
-        `[Background] Received image chunk for unknown chapter: ${chapterName}. Initializing buffer.`,
+        `[Background] Ignoring image chunk for inactive chapter: ${chapterName}.`,
       );
-      // This should ideally not happen if flow is correct, but for robustness:
-      chapterImageBuffers.set(chapterName, {
-        receivedImages: [],
-        resolveCallback: null, // This will be set when startChapterImageFetch returns a promise
-        expectedImagesPromise: null, // This will be set by the background script's internal logic
-      });
+      return;
     }
-
     const buffer = chapterImageBuffers.get(chapterName);
-
-    if (base64) {
-      buffer.receivedImages.push({ index: imageIndex, base64: base64 });
-    } else if (error) {
+    if (error) {
       console.error(
-        `[Background] Content script reported error for image ${imageIndex} of ${chapterName}: ${error}`,
+        `[Chapter: ${chapterName}] Received error for image ${imageIndex}: ${error}`,
       );
-      // We still add a placeholder to ensure the count is correct for completion check
       buffer.receivedImages.push({ index: imageIndex, error: error });
+    } else {
+      // This log is too noisy for normal use, but useful for deep debugging.
+      // console.log(`[Chapter: ${chapterName}] Received image chunk ${imageIndex}.`);
+      buffer.receivedImages.push({ index: imageIndex, base64: base64 });
     }
   } else if (request.action === "chapterDownloadComplete") {
-    // Message from content script indicating all images for a chapter have been sent
     const { chapterName, totalImages } = request;
-    console.log(
-      `[Background] Received 'chapterDownloadComplete' for ${chapterName}. Expected: ${totalImages}, Received: ${chapterImageBuffers.get(chapterName)?.receivedImages.length || 0}`,
-    );
-
     const buffer = chapterImageBuffers.get(chapterName);
+    console.log(
+      `[Chapter: ${chapterName}] Received 'chapterDownloadComplete'. Expected: ${totalImages}, Received: ${buffer?.receivedImages.length || 0}`,
+    );
     if (buffer && buffer.resolveCallback) {
-      // Sort images by index to ensure correct order
       buffer.receivedImages.sort((a, b) => a.index - b.index);
       buffer.resolveCallback({
         success: true,
-        images: buffer.receivedImages.filter((img) => !img.error), // Only pass successful images
+        images: buffer.receivedImages.filter((img) => !img.error),
         totalImages: totalImages,
       });
-      chapterImageBuffers.delete(chapterName); // Clean up buffer
-    } else {
-      console.warn(
-        `[Background] 'chapterDownloadComplete' received for ${chapterName} but no active promise to resolve.`,
-      );
     }
   } else if (request.action === "chapterDownloadError") {
-    // Message from content script indicating an error occurred during chapter image extraction
     const { chapterName, error } = request;
     console.error(
-      `[Background] Content script reported 'chapterDownloadError' for ${chapterName}: ${error}`,
+      `[Chapter: ${chapterName}] Received 'chapterDownloadError': ${error}`,
     );
     const buffer = chapterImageBuffers.get(chapterName);
     if (buffer && buffer.resolveCallback) {
       buffer.resolveCallback({ success: false, error: error });
-      chapterImageBuffers.delete(chapterName); // Clean up buffer
     }
   }
-  return true; // Keep the message channel open for async response
+  return true;
 });
 
-// --- Function to convert a Blob to a Data URL ---
 function blobToDataURL(blob) {
-  // Console logs are kept for robustness in case errors still occur here
-  console.log(
-    `🔵 INFO: In blobToDataURL. Blob type: ${blob?.type}, size: ${blob?.size}`,
-  );
-  if (!blob || !(blob instanceof Blob)) {
-    console.error("❌ ERROR: blobToDataURL received an invalid blob object.");
-    return Promise.reject(
-      new Error("Invalid Blob object provided to blobToDataURL."),
-    );
-  }
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () => {
-      console.log("✅ INFO: FileReader onload completed.");
-      resolve(reader.result);
-    };
-    reader.onerror = (e) => {
-      console.error("❌ ERROR: FileReader onerror triggered.", e);
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = (e) =>
       reject(reader.error || new Error("FileReader failed."));
-    };
-    try {
-      reader.readAsDataURL(blob);
-      console.log("🔵 INFO: FileReader.readAsDataURL called.");
-    } catch (e) {
-      console.error("❌ ERROR: Error calling FileReader.readAsDataURL:", e);
-      reject(e);
-    }
+    reader.readAsDataURL(blob);
   });
 }
 
-// --- Main function to orchestrate the download of multiple chapters ---
 async function downloadChaptersInBackground(chapters, mangaTitle) {
   console.log(
-    `🔵 INFO: Starting download process for ${chapters.length} chapter(s).`,
+    `🔵 INFO: Starting download process for ${chapters.length} chapter(s). Manga: "${mangaTitle}"`,
   );
 
   for (const chapter of chapters) {
-    try {
-      console.log(
-        `[Chapter: ${chapter.name}] --- Requesting content script to fetch images... ---`,
-      );
+    if (activeDownloadTabId === null) {
+      console.log("Download process was cancelled. Aborting loop.");
+      break;
+    }
 
-      // Setup a promise to wait for all image chunks for this chapter
+    console.log(`[Chapter: ${chapter.name}] --- Starting Process ---`);
+    try {
       let chapterImagesPromise = new Promise((resolve) => {
-        // Store the resolve function in our buffer map
+        console.log(
+          `[Chapter: ${chapter.name}]   - Creating promise and buffer.`,
+        );
         chapterImageBuffers.set(chapter.name, {
           receivedImages: [],
           resolveCallback: resolve,
         });
       });
 
-      // Send message to content script to start fetching and sending images for this chapter
+      console.log(
+        `[Chapter: ${chapter.name}]   - Sending message to content script to fetch images.`,
+      );
       chrome.tabs.sendMessage(
-        activeTabId,
+        activeDownloadTabId,
         {
           action: "startChapterImageFetch",
           chapterUrl: chapter.url,
@@ -160,7 +153,7 @@ async function downloadChaptersInBackground(chapters, mangaTitle) {
         (response) => {
           if (chrome.runtime.lastError) {
             console.error(
-              `[Background] Error sending startChapterImageFetch message to content script: ${chrome.runtime.lastError.message}`,
+              `[Chapter: ${chapter.name}]   - Error sending message: ${chrome.runtime.lastError.message}`,
             );
             const buffer = chapterImageBuffers.get(chapter.name);
             if (buffer && buffer.resolveCallback) {
@@ -168,126 +161,95 @@ async function downloadChaptersInBackground(chapters, mangaTitle) {
                 success: false,
                 error: chrome.runtime.lastError.message,
               });
-              chapterImageBuffers.delete(chapter.name); // Clean up
             }
-          } else if (response && !response.success) {
-            console.error(
-              `[Background] Content script failed to start image fetch for ${chapter.name}: ${response.error}`,
-            );
-            const buffer = chapterImageBuffers.get(chapter.name);
-            if (buffer && buffer.resolveCallback) {
-              buffer.resolveCallback({ success: false, error: response.error });
-              chapterImageBuffers.delete(chapter.name); // Clean up
-            }
-          } else {
-            console.log(
-              `[Background] Content script acknowledged start for ${chapter.name}.`,
-            );
           }
         },
       );
-      // Ensure the response from sendMessage is handled, but the actual images
-      // will come via subsequent 'imageChunk' messages. We await chapterImagesPromise.
 
-      const chapterResult = await chapterImagesPromise; // Wait until content script signals completion
+      console.log(
+        `[Chapter: ${chapter.name}]   - Awaiting all image chunks...`,
+      );
+      const chapterResult = await chapterImagesPromise;
 
       if (chapterResult.success) {
         const images = chapterResult.images;
         console.log(
-          `[Chapter: ${chapter.name}] ✅ SUCCESS: Received ${images.length} successful images from content script.`,
+          `[Chapter: ${chapter.name}] ✅ SUCCESS: Received ${images.length} of ${chapterResult.totalImages} images from content script.`,
         );
 
         if (images.length === 0) {
           console.warn(
-            `[Chapter: ${chapter.name}] ⚠️ WARNING: No images successfully downloaded for zipping.`,
-          );
-          continue; // Skip zipping if no images were obtained
-        }
-
-        console.log(`[Chapter: ${chapter.name}] --- Creating ZIP file... ---`);
-        const zipBlob = await createZip(images, chapter.name);
-        console.log(
-          `[Chapter: ${chapter.name}] ✅ SUCCESS: ZIP Blob created. Type: ${zipBlob?.type}, Size: ${zipBlob?.size} bytes.`,
-        );
-
-        if (zipBlob.size === 0) {
-          console.error(
-            `[Chapter: ${chapter.name}] ❌ ERROR: Generated ZIP file is empty.`,
+            `[Chapter: ${chapter.name}] ⚠️ WARNING: No images were successfully downloaded. Skipping ZIP creation.`,
           );
           continue;
         }
 
+        console.log(`[Chapter: ${chapter.name}]   - Creating ZIP file...`);
+        const zipBlob = await createZip(images, chapter.name);
         console.log(
-          `[Chapter: ${chapter.name}] --- Preparing to convert Blob to Data URL... ---`,
-        );
-        const dataUrl = await blobToDataURL(zipBlob);
-        console.log(
-          `[Chapter: ${chapter.name}] ✅ SUCCESS: Converted to Data URL.`,
+          `[Chapter: ${chapter.name}]   - ZIP Blob created. Size: ${zipBlob.size} bytes.`,
         );
 
+        const dataUrl = await blobToDataURL(zipBlob);
         const sanitizedChapterName = chapter.name.replace(
           /[\/\\?%*:|"<>]/g,
           "-",
         );
         const filename = `DC/${mangaTitle}/${sanitizedChapterName}.zip`;
-        console.log(
-          `[Chapter: ${chapter.name}] --- Initiating download with filename: ${filename} ---`,
-        );
 
+        console.log(
+          `[Chapter: ${chapter.name}]   - Initiating download: "${filename}"`,
+        );
         chrome.downloads.download(
-          {
-            url: dataUrl,
-            filename: filename,
-            saveAs: false,
-          },
+          { url: dataUrl, filename: filename, saveAs: false },
           (downloadId) => {
             if (chrome.runtime.lastError) {
               console.error(
-                `[Chapter: ${chapter.name}] ❌ ERROR: chrome.downloads.download API failed.`,
+                `[Chapter: ${chapter.name}] ❌ DOWNLOAD FAILED:`,
                 chrome.runtime.lastError.message,
               );
-            } else if (downloadId) {
-              console.log(
-                `[Chapter: ${chapter.name}] ✅ FINAL SUCCESS: Download initiated with ID: ${downloadId}.`,
-              );
             } else {
-              console.error(
-                `[Chapter: ${chapter.name}] ❌ ERROR: Download API did not return an ID or an error.`,
+              console.log(
+                `[Chapter: ${chapter.name}] ✅ FINAL SUCCESS: Download started with ID: ${downloadId}.`,
               );
             }
           },
         );
       } else {
         console.error(
-          `[Chapter: ${chapter.name}] ❌ ERROR: Content script reported an error fetching images: ${chapterResult.error}`,
+          `[Chapter: ${chapter.name}] ❌ FAILED: Did not receive images successfully. Reason: ${chapterResult.error}`,
         );
       }
     } catch (error) {
       console.error(
-        `[Chapter: ${chapter.name}] ❌ FATAL ERROR in processing loop for chapter "${chapter.name}":`,
+        `[Chapter: ${chapter.name}] ❌ FATAL ERROR in download loop:`,
         error,
       );
+    } finally {
+      console.log(`[Chapter: ${chapter.name}]   - Cleaning up memory buffer.`);
+      chapterImageBuffers.delete(chapter.name);
+      console.log(`[Chapter: ${chapter.name}] --- Finished Process ---`);
     }
-    await new Promise((resolve) => setTimeout(resolve, 1000)); // Delay between chapters
+    await new Promise((resolve) => setTimeout(resolve, 1000));
   }
+
   console.log("🔵 INFO: All selected chapters have been processed.");
+  activeDownloadTabId = null;
 }
 
-// --- Function to create a ZIP file from the image data ---
 async function createZip(images, chapterName) {
   if (typeof JSZip === "undefined") {
-    console.error(`[Chapter: ${chapterName}] ❌ ERROR: JSZip is not defined.`);
     throw new Error("JSZip library is not loaded.");
   }
+
   const zip = new JSZip();
   images.forEach((image) => {
-    // Ensure image.base64 exists and is a string
     if (image && typeof image.base64 === "string") {
       const filename = `${String(image.index + 1).padStart(3, "0")}.jpg`;
       zip.file(filename, image.base64, { base64: true });
     } else {
       console.warn(
-        `[Chapter: ${chapterName}] Skipped invalid or missing image data at index ${image?.index || "unknown"}.`,
+        `[Chapter: ${chapterName}] Skipped invalid image data at index ${image?.index || "unknown"}.`,
       );
     }
   });
